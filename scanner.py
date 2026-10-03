@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-Scan for SunSpec Map provided by SolarEdge inverters.
+Scan SolarEdge inverters for a SunSpec Map and attached batteries.
+Then print information about what was (and was not) found.
 
-usage: scanner.py 
+usage: scanner.py [-h] [--device-id [1-255]] [--dump-registers] host port
+
+positional arguments:
+  host                 modbus TCP address
+  port                 modbus TCP port
+
+options:
+  -h, --help           show this help message and exit
+  --device-id [1-255]  modbus device address (default: 1)
+  --do-not-dump-registers
+                        do not dump modbus registers in output
 """
 
 import argparse
@@ -11,86 +22,93 @@ from pymodbus import ModbusException
 from pymodbus.pdu import ModbusPDU
 
 
-def read_string_register(client: ModbusClient.ModbusTcpClient, address: int, device_id: int, count: int) -> tuple[int, str]:
+def modbus_read(client: ModbusClient.ModbusTcpClient, device_id: int, address: int, count: int) -> list[int]:
 
-    try:
-        rr: ModbusPDU = client.read_holding_registers(address=address, count=count, device_id=device_id)
-    except ModbusException as exc:
-        print(f"Received ModbusException({exc}) from library")
-        return -1,""
-    if rr.isError():
-        print(f"Received exception from device ({rr})")
-        return -1,""
+    result: list[int] = []
+    start: int = address
+    end: int = address + count
+    read_now: int
 
-    try:
-        converted_value = client.convert_from_registers(registers=rr.registers, data_type=client.DATATYPE.STRING)
-    except Exception as exc:
-        print(f"Received Exception({exc}) while convert_from_registers")
-        return address+count,""
+    # read_holding_registers only allows 125 registers in one go
+    # we need to loop if we have more to read than that
 
-    if isinstance(converted_value, str):
-        return address+count, converted_value
-    else:
-        return -1,""
+    while start < end:
+        if end - start > 125:
+            read_now = 125
+        else:
+            read_now = end - start
 
+        try:
+            rr: ModbusPDU = client.read_holding_registers(address=start, count=read_now, device_id=device_id)
+        except ModbusException as exc:
+            print(f"Received ModbusException({exc}) from library")
+            return []
+        if rr.isError():
+            print(f"Received exception from device ({rr})")
+            return []
 
-def read_int_register(client: ModbusClient.ModbusTcpClient, address: int, device_id: int) -> tuple[int, int]:
+        if len(rr.registers) != read_now:
+            print(f"expected [{read_now}] got [{len(rr.registers)}]")
 
-    try:
-        rr: ModbusPDU = client.read_holding_registers(address=address, count=1, device_id=device_id)
-    except ModbusException as exc:
-        print(f"Received ModbusException({exc}) from library")
-        client.close()
-        return -1,-1
-    if rr.isError():
-        print(f"Received exception from device ({rr})")
-        client.close()
-        return -1,-1
+        start += read_now
+        result.extend(rr.registers)
 
-    converted_value = client.convert_from_registers(registers=rr.registers, data_type=client.DATATYPE.INT16)
-
-    if isinstance(converted_value, int):
-        return address+1, int(converted_value)
-    else:
-        return -1,-1
+    return result
 
 
-def process_common_block(client: ModbusClient.ModbusTcpClient, start_address: int, device_id: int) -> None:
+def get_value(registers: list[int], offset:int, count:int, data_type: ModbusClient.ModbusTcpClient.DATATYPE) -> int | float | str | list[bool] | list[int] | list[float]:
 
-    next_address, manufacturer = read_string_register(client=client, address=start_address, device_id=device_id, count=16)
-    next_address, model = read_string_register(client=client, address=next_address, device_id=device_id, count=16)
-    next_address, options = read_string_register(client=client, address=next_address, device_id=device_id, count=8)
-    next_address, version = read_string_register(client=client, address=next_address, device_id=device_id, count=8)
-    next_address, serial_number = read_string_register(client=client, address=next_address, device_id=device_id, count=16)
-    next_address, device_address = read_int_register(client=client, address=next_address, device_id=device_id)
-    
+    return client.convert_from_registers(registers=registers[offset:offset+count], data_type=data_type)
+
+
+def sunspec_found(client: ModbusClient.ModbusTcpClient, device_id: int, address: int) -> bool:
+
+    print(f"  Looking for SunSpec identifier at address [{address} ({hex(address)})] for device [{device_id}]")
+
+    registers: list[int] = modbus_read(client=client, device_id=device_id, address=address, count=2)
+    identifier: str = get_value(registers=registers, offset=0, count=2, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING)  # type: ignore
+
+    return identifier == "SunS"
+
+
+def display_common_block(client: ModbusClient.ModbusTcpClient, device_id: int, start_address: int) -> None:
+
+    registers = modbus_read(client=client, device_id=device_id, address=start_address, count=66)
+
+    manufacturer:str = get_value(registers=registers, offset=0, count=16, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING) # type: ignore
+    model:str = get_value(registers=registers, offset=16, count=16, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING) # type: ignore
+    options:str = get_value(registers=registers, offset=32, count=8, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING) # type: ignore
+    version:str = get_value(registers=registers, offset=40, count=8, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING) # type: ignore
+    device_address:int = get_value(registers=registers, offset=64, count=1, data_type=ModbusClient.ModbusTcpClient.DATATYPE.UINT16) # type: ignore
+
     print(f"     Manufacturer:   [{manufacturer}]")
     print(f"     Model:          [{model}]")
     print(f"     Options:        [{options}]")
     print(f"     Version:        [{version}]")
-#    print(f"     Serial Number:  [{serial_number}]")
-    print( "     Serial Number:  [hidden]")
     print(f"     Device Address: [{device_address}]")
 
 
-def read_block(client: ModbusClient.ModbusTcpClient, block_address: int, device_id: int) -> int:
+def process_sunspec_block(client: ModbusClient.ModbusTcpClient, device_id: int, block_address: int, dump: bool = False) -> int:
 
     print()
     print(f"   Reading Block at address [{block_address} ({hex(block_address)})] for device [{device_id}]")
 
-    next_address, block_id = read_int_register(client=client, address=block_address, device_id=device_id)
-    next_address, block_length = read_int_register(client=client, address=next_address, device_id=device_id)
+    registers: list[int] = modbus_read(client=client, device_id=device_id, address=block_address, count=2)
+    next_address: int = block_address + 2
+
+    block_id: int = get_value(registers=registers, offset=0, count=1, data_type=ModbusClient.ModbusTcpClient.DATATYPE.UINT16) # type: ignore
+    block_length: int = get_value(registers=registers, offset=1, count=1, data_type=ModbusClient.ModbusTcpClient.DATATYPE.UINT16) # type: ignore
 
     print(f"    Block id     = [{block_id}]")
     print(f"    Block length = [{block_length}]")
 
     match block_id:
-        case -1:
+        case 65535:
             print("    Block type   = [The End of the block list has been reached]")
             next_address = -1
         case 1:
             print("    Block type   = [Common - All SunSpec compliant devices must include this as the first model]")
-            process_common_block(client=client, start_address=next_address, device_id=device_id)
+            display_common_block(client=client, device_id=device_id, start_address=next_address)
         case 2:
             print("    Block type   = [Basic Aggregator - Aggregates a collection of models for a given model id]")
         case 3:
@@ -291,32 +309,46 @@ def read_block(client: ModbusClient.ModbusTcpClient, block_address: int, device_
             print("    Block type   = [Unknown]")
 
     if next_address >= 0 and block_length > 0:
+        if dump:
+            registers = modbus_read(client=client, device_id=device_id, address=block_address, count=block_length+2)
+            if registers:
+                print(f"    Registers    = {registers}")
+            else:
+                print("    Registers    = [None]")
+
         return next_address + block_length
     else:
         return -1
 
 
+def process_battery(client: ModbusClient.ModbusTcpClient, device_id: int, address: int, dump: bool = False) -> None:
 
-def read_battery(client: ModbusClient.ModbusTcpClient, address: int, device_id: int) -> None:
+    print(f"  Looking for Battery at address [{address} ({hex(address)})] for device [{device_id}]")
 
-    print()
-    print(f"   Reading Battery at address [{address} ({hex(address)})] for device [{device_id}]")
+    registers: list[int] = modbus_read(client=client, device_id=device_id, address=address, count=66)
+    battery_device_id: int = get_value(registers=registers, offset=64, count=1, data_type=ModbusClient.ModbusTcpClient.DATATYPE.UINT16)  # type: ignore
 
-    next_address, manufacturer = read_string_register(client=client, address=address, device_id=device_id, count=16)
-    next_address, model = read_string_register(client=client, address=next_address, device_id=device_id, count=16)
-    next_address, firmware_version = read_string_register(client=client, address=next_address, device_id=device_id, count=16)
-    next_address, serial_number = read_string_register(client=client, address=next_address, device_id=device_id, count=16)
-    next_address, battery_device_id = read_int_register(client=client, address=next_address, device_id=device_id)
-    next_address, battery_reserved = read_int_register(client=client, address=next_address, device_id=device_id)
+    if battery_device_id == 255 or registers[0] == 0:
+        print("   No battery found at this address")
+        print()
+    else:
+        manufacturer:str = get_value(registers=registers, offset=0, count=16, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING)  # type: ignore
+        model:str = get_value(registers=registers, offset=16, count=16, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING)  # type: ignore
+        firmware_version:str = get_value(registers=registers, offset=32, count=16, data_type=ModbusClient.ModbusTcpClient.DATATYPE.STRING)  # type: ignore
 
-    print(f"     Manufacturer:     [{manufacturer}]")
-    print(f"     Model:            [{model}]")
-    print(f"     Firmware Version: [{firmware_version}]")
-    print(f"     Serial Number:    [{serial_number}]")
-#    print( "     Serial Number:    [hidden]")
-    print(f"     Device id:        [{battery_device_id}]")
-    print(f"     Reserved:         [{battery_reserved}]")
-    print(f"     Next Address:     [{next_address} ({hex(next_address)})]")
+        print()
+        print(f"     Manufacturer     [{manufacturer}]")
+        print(f"     Model            [{model}]")
+        print(f"     Firmware Version [{firmware_version}]")
+        print(f"     Device id        [{battery_device_id}]")
+
+        if dump:
+            registers = modbus_read(client=client, device_id=device_id, address=address, count=410)
+            if registers:
+                print(f"     Registers        {registers}")
+            else:
+                print("     Registers        [None]")
+        print()
 
 
 if __name__ == "__main__":
@@ -325,6 +357,8 @@ if __name__ == "__main__":
     argparser.add_argument("host", type=str, help="modbus TCP address")
     argparser.add_argument("port", type=int, help="modbus TCP port")
     argparser.add_argument("--device-id", type=int, choices=range(1, 256), default=1, metavar="[1-255]", help="modbus device address (default: 1)")
+    argparser.add_argument("--do-not-dump-registers", action='store_false', help="do not dump modbus registers in output")
+
     args: argparse.Namespace = argparser.parse_args()
 
     client = ModbusClient.ModbusTcpClient(host=args.host, port=args.port)
@@ -332,27 +366,28 @@ if __name__ == "__main__":
     print("Connecting to server")
     client.connect()
     if client.connected:
+        print()
+
         print(" Connected to server")
         print()
 
-        block_address, sunspecs = read_string_register(client=client, address=40000, device_id=args.device_id, count=2)
-        if sunspecs == "SunS":
+        if sunspec_found(client = client, device_id=args.device_id, address=40000):
             print("  The inverter is providing a SunSpec Map")
 
-            while block_address > 0 and client.connected:
-                block_address = read_block(client=client, block_address=block_address, device_id=args.device_id)
+            address: int = 40002
+            while address > 0 and client.connected:
+                address = process_sunspec_block(client=client, device_id=args.device_id, block_address=address, dump=args.do_not_dump_registers)
 
             print()
-            print("  End of Sunspec MAP")
+            print("  End of SunSpec MAP")
         else:
             print("  The inverter is NOT providing a SunSpec Map")
 
         print()
-        print("  Trying to probe for batteries")
-        read_battery(client=client, address=57600, device_id=args.device_id)
-        read_battery(client=client, address=57856, device_id=args.device_id)
 
-    print()
+        process_battery(client=client, device_id=args.device_id, address=57600, dump=args.do_not_dump_registers)
+        process_battery(client=client, device_id=args.device_id, address=57856, dump=args.do_not_dump_registers)
+
     if client.connected:
         client.close()
         print("Disconnected from server")
