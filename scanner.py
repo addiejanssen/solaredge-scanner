@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     args: argparse.Namespace = argparser.parse_args()
 
-    client = ModbusTcpClient(host=args.host, port=args.port)
+    client = ModbusTcpClient(host=args.host, port=args.port, timeout=15)
 
     print("Connecting to server")
     client.connect()
